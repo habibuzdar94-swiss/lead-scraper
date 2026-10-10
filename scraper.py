@@ -556,7 +556,7 @@ class Scraper:
     def _parse_soup(self, soup: BeautifulSoup, page_url: str) -> List[Listing]:
         try:
             cards = soup.select(self.config.listing_selector)
-             except Exception as exc:
+        except Exception as exc:
             raise ConfigError(
                 f"Invalid LISTING_SELECTOR {self.config.listing_selector!r}: {exc}"
             ) from exc
