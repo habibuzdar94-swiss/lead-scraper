@@ -1,6 +1,9 @@
 name: Scrape listings
 
 on:
+  push:
+    paths:
+      - ".github/workflows/scrape.yml"
   schedule:
     - cron: "0 3 * * *"
   workflow_dispatch:
