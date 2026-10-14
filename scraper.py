@@ -1,778 +1,401 @@
-"""Real estate listing scraper.
+"""Polite Realtor.com search-results scraper.
 
-Collects listings from a paginated website, extracts property details,
-removes duplicates, and exports CSV and JSON files. All site-specific
-behaviour (URL, pagination, CSS selectors) lives in config.py / environment
-variables.
+Reads Realtor.com SEARCH URLs from urls.txt, ignores non-search/detail/article URLs,
+extracts embedded __NEXT_DATA__ listing objects first, then falls back to card HTML,
+walks /pg-N pagination, de-duplicates records, and exports CSV + JSON.
 
-Exit codes:
-  0  success
-  1  no listings were collected
-  2  invalid configuration
-  3  blocked by robots.txt
-  4  fewer than MIN_LISTINGS collected and --strict / STRICT is enabled
+This uses ordinary HTTP requests and respects robots.txt. Realtor.com may return
+403/429 or an HTML shell to automated requests; this script intentionally does not
+bypass access controls. If that happens, reduce request volume or use an authorized
+data/API provider.
 """
 from __future__ import annotations
 
-import argparse
 import csv
-import hashlib
 import json
 import logging
 import os
 import random
 import re
-import sys
 import time
-from dataclasses import asdict, dataclass, fields, replace
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
-from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
+from typing import Any, Iterable
+from urllib.parse import urljoin, urlparse, urlunparse
 from urllib.robotparser import RobotFileParser
 
 import requests
 from bs4 import BeautifulSoup
 
-from config import Config, ConfigError, load_config
+LOG = logging.getLogger("realtor_scraper")
+BASE_DOMAIN = "https://www.realtor.com"
+SEARCH_MARKERS = ("/realestateandhomes-search/", "/apartments/")
 
-logger = logging.getLogger("scraper")
-
-RETRYABLE_STATUS = {408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524}
-MAX_RETRY_AFTER_SECONDS = 120
-MAX_DESCRIPTION_LENGTH = 2000
-
-CURRENCY_SYMBOLS = {
-    "$": "USD", "€": "EUR", "£": "GBP", "¥": "JPY", "₹": "INR",
-    "₨": "PKR", "₽": "RUB", "₺": "TRY", "₩": "KRW",
-}
-CURRENCY_CODE_RE = re.compile(
-    r"\b(USD|EUR|GBP|CHF|CAD|AUD|AED|PKR|INR|SAR|JPY|CNY|SEK|NOK|DKK|PLN|CZK|"
-    r"TRY|MXN|BRL|ZAR|SGD|HKD|NZD)\b"
-)
-TRACKING_PARAMS = {"fbclid", "gclid", "msclkid", "ref", "ref_src", "mc_cid", "mc_eid"}
-
-LISTING_TYPES = {
-    "realestatelisting", "residence", "house", "apartment",
-    "singlefamilyresidence", "accommodation", "product",
-}
-RESIDENCE_TYPES = {"house", "apartment", "singlefamilyresidence"}
-
-
-class RobotsDisallowedError(RuntimeError):
-    """Raised when robots.txt forbids fetching the target URL."""
-
-
-# --------------------------------------------------------------------------- #
-# Text / number helpers
-# --------------------------------------------------------------------------- #
-def clean_text(value: Any) -> str:
-    if value is None:
-        return ""
-    return re.sub(r"\s+", " ", str(value)).strip()
-
-
-def _tidy(value: Optional[float]) -> Optional[float]:
-    """Return ints for whole numbers so exports look clean."""
-    if value is None:
-        return None
-    if isinstance(value, float) and value.is_integer():
-        return int(value)
-    return value
-
-
-def _normalise_numeric(token: str) -> Optional[float]:
-    token = token.strip().replace(" ", "").replace("\u00a0", "").strip(".,")
-    if not token:
-        return None
-    has_dot, has_comma = "." in token, "," in token
-    if has_dot and has_comma:
-        if token.rfind(",") > token.rfind("."):  # 1.234,56
-            token = token.replace(".", "").replace(",", ".")
-        else:  # 1,234.56
-            token = token.replace(",", "")
-    elif has_comma:
-        if re.fullmatch(r"\d{1,3}(,\d{3})+", token):
-            token = token.replace(",", "")
-        else:
-            token = token.replace(",", ".")
-    elif has_dot and token.count(".") > 1:
-        if re.fullmatch(r"\d{1,3}(\.\d{3})+", token):
-            token = token.replace(".", "")
-        else:
-            return None
-    try:
-        return float(token)
-    except ValueError:
-        return None
-
-
-def parse_number(text: Any) -> Optional[float]:
-    """Return the first number found in ``text`` (or None)."""
-    if text is None:
-        return None
-    cleaned = str(text).replace("'", "").replace("’", "")
-    match = re.search(r"\d[\d.,]*\d|\d", cleaned)
-    if not match:
-        return None
-    return _tidy(_normalise_numeric(match.group(0)))
-
-
-def detect_currency(text: str) -> str:
-    match = CURRENCY_CODE_RE.search(text)
-    if match:
-        return match.group(1)
-    for symbol, code in CURRENCY_SYMBOLS.items():
-        if symbol in text:
-            return code
-    return ""
-
-
-def parse_price(text: Any) -> Tuple[Optional[float], str]:
-    """Return ``(value, currency)`` parsed from a price string."""
-    if not text:
-        return None, ""
-    raw = str(text)
-    currency = detect_currency(raw)
-    cleaned = raw.replace("'", "").replace("’", "")
-    cleaned = re.sub(r"(?<=\d)[ \u00a0\u202f](?=\d{3}(?!\d))", "", cleaned)
-    match = re.search(r"(\d[\d.,]*\d|\d)\s*([kKmM])?(?![a-zA-Z])", cleaned)
-    if not match:
-        return None, currency
-    value = _normalise_numeric(match.group(1))
-    if value is None:
-        return None, currency
-    suffix = (match.group(2) or "").lower()
-    if suffix == "k":
-        value *= 1_000
-    elif suffix == "m":
-        value *= 1_000_000
-    return _tidy(value), currency
-
-
-def normalize_url(url: str) -> str:
-    """Normalise a URL for duplicate detection."""
-    if not url:
-        return ""
-    parsed = urlparse(url.strip())
-    query = [
-        (k, v)
-        for k, v in parse_qsl(parsed.query, keep_blank_values=True)
-        if not k.lower().startswith("utm_") and k.lower() not in TRACKING_PARAMS
-    ]
-    query.sort()
-    path = parsed.path.rstrip("/") or "/"
-    return urlunparse(
-        (parsed.scheme.lower(), parsed.netloc.lower(), path, "", urlencode(query), "")
-    )
-
-
-def id_from_url(url: str) -> str:
-    if not url:
-        return ""
-    numbers = re.findall(r"\d{4,}", urlparse(url).path)
-    return numbers[-1] if numbers else ""
-
-
-# --------------------------------------------------------------------------- #
-# CSS selector helpers
-# --------------------------------------------------------------------------- #
-def _select_one(node: Any, selector: str) -> str:
-    selector = selector.strip()
-    if not selector:
-        return ""
-    css, attr = selector, None
-    if "@" in selector:
-        css, attr = selector.rsplit("@", 1)
-        css, attr = css.strip(), attr.strip()
-    target = node.select_one(css) if css else node
-    if target is None:
-        return ""
-    if attr:
-        value = target.get(attr, "")
-        if isinstance(value, (list, tuple)):
-            value = " ".join(value)
-        return clean_text(value)
-    return clean_text(target.get_text(" ", strip=True))
-
-
-def select_value(node: Any, selector: str) -> str:
-    """Extract text/attribute using the selector mini-syntax from config.py."""
-    if not selector:
-        return ""
-    for alternative in selector.split("||"):
-        value = _select_one(node, alternative)
-        if value:
-            return value
-    return ""
-
-
-# --------------------------------------------------------------------------- #
-# Data model
-# --------------------------------------------------------------------------- #
 @dataclass
 class Listing:
     listing_id: str = ""
-    title: str = ""
     price: str = ""
-    price_value: Optional[float] = None
-    currency: str = ""
     address: str = ""
+    city: str = ""
+    state: str = ""
+    zip_code: str = ""
+    bedrooms: str = ""
+    bathrooms: str = ""
+    sqft: str = ""
+    lot_size: str = ""
     property_type: str = ""
-    bedrooms: Optional[float] = None
-    bathrooms: Optional[float] = None
-    area: str = ""
-    area_value: Optional[float] = None
-    description: str = ""
+    status: str = ""
+    listing_date: str = ""
+    agent_name: str = ""
+    agent_phone: str = ""
     url: str = ""
     image_url: str = ""
-    source_page: str = ""
+    search_page_url: str = ""
     scraped_at: str = ""
 
-    def dedupe_key(self) -> str:
-        if self.url:
-            return "url:" + normalize_url(self.url)
-        if self.listing_id:
-            return "id:" + self.listing_id
-        raw = "|".join(x.lower().strip() for x in (self.title, self.address, self.price))
-        return "hash:" + hashlib.sha1(raw.encode("utf-8")).hexdigest()
-
-    def is_meaningful(self) -> bool:
-        return bool(self.title or self.url or self.price or self.address)
+    def key(self) -> str:
+        return self.listing_id or self.url or "|".join((self.address, self.price, self.city, self.state))
 
 
-# --------------------------------------------------------------------------- #
-# JSON-LD helpers
-# --------------------------------------------------------------------------- #
-def _as_list(value: Any) -> List[Any]:
+def clean(value: Any) -> str:
     if value is None:
-        return []
-    return value if isinstance(value, list) else [value]
-
-
-def _types_of(node: Dict[str, Any]) -> set:
-    return {
-        str(t).lower().split("/")[-1].split(":")[-1]
-        for t in _as_list(node.get("@type"))
-    }
-
-
-def iter_json_ld_items(data: Any) -> Iterator[Dict[str, Any]]:
-    """Yield listing-like objects from parsed JSON-LD."""
-    if isinstance(data, list):
-        for element in data:
-            yield from iter_json_ld_items(element)
-        return
-    if not isinstance(data, dict):
-        return
-    if "@graph" in data:
-        yield from iter_json_ld_items(data["@graph"])
-    types = _types_of(data)
-    if types & LISTING_TYPES:
-        yield data
-    elif "itemlist" in types:
-        for element in _as_list(data.get("itemListElement")):
-            if not isinstance(element, dict):
-                continue
-            item = element.get("item", element)
-            if isinstance(item, str):
-                item = {"url": item}
-            if isinstance(item, dict) and (
-                _types_of(item) & LISTING_TYPES or item.get("url") or item.get("name")
-            ):
-                yield item
-
-
-def _json_number(value: Any) -> Optional[float]:
-    if isinstance(value, dict):
-        value = value.get("value")
-    if value is None or isinstance(value, bool):
-        return None
+        return ""
     if isinstance(value, (int, float)):
-        return _tidy(float(value))
-    return parse_number(value)
+        return str(value)
+    return re.sub(r"\s+", " ", str(value)).strip()
 
 
-def _first_url(value: Any) -> str:
-    for element in _as_list(value):
-        if isinstance(element, str) and element:
-            return element
-        if isinstance(element, dict):
-            candidate = element.get("url") or element.get("contentUrl")
-            if candidate:
-                return str(candidate)
-    return ""
+def nested(obj: Any, *path: str, default: Any = "") -> Any:
+    cur = obj
+    for key in path:
+        if not isinstance(cur, dict):
+            return default
+        cur = cur.get(key)
+    return default if cur is None else cur
 
 
-def _format_address(value: Any) -> str:
-    if isinstance(value, str):
-        return clean_text(value)
-    if isinstance(value, dict):
-        if "address" in value and "streetAddress" not in value:
-            return _format_address(value["address"])
-        parts = []
-        for key in ("streetAddress", "addressLocality", "addressRegion",
-                    "postalCode", "addressCountry"):
-            part = value.get(key)
-            if isinstance(part, dict):
-                part = part.get("name")
-            if part:
-                parts.append(clean_text(part))
-        return ", ".join(parts)
-    return ""
-
-
-# --------------------------------------------------------------------------- #
-# Scraper
-# --------------------------------------------------------------------------- #
-class Scraper:
-    def __init__(self, config: Config, session: Optional[Any] = None) -> None:
-        self.config = config
-        self.session = session or requests.Session()
-        self.session.headers.update(
-            {
-                "User-Agent": config.user_agent,
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": config.accept_language,
-            }
-        )
-        self._robots: Dict[str, Optional[RobotFileParser]] = {}
-        self._run_timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        self.stats: Dict[str, int] = {
-            "pages_fetched": 0,
-            "pages_failed": 0,
-            "listings_seen": 0,
-            "duplicates_skipped": 0,
-        }
-
-    # ------------------------------------------------------------ robots.txt
-    def _load_robots(self, origin: str) -> Optional[RobotFileParser]:
-        robots_url = origin + "/robots.txt"
-        try:
-            response = self.session.get(
-                robots_url, timeout=self.config.timeout, verify=self.config.verify_ssl
-            )
-        except requests.RequestException as exc:
-            logger.warning("Could not fetch %s (%s); assuming allowed.", robots_url, exc)
+def search_seed(url: str) -> str | None:
+    """Normalize a URL to its location-level search seed; reject detail/article URLs."""
+    url = url.strip()
+    if not url:
+        return None
+    parsed = urlparse(url)
+    if parsed.netloc.lower() not in {"www.realtor.com", "realtor.com"}:
+        return None
+    path = parsed.path.rstrip("/")
+    if "/realestateandhomes-search/" in path:
+        tail = path.split("/realestateandhomes-search/", 1)[1]
+        location = tail.split("/", 1)[0]
+        if not location or location.lower() == "near-me":
+            # near-me depends on an interactive/current location and is not a reliable seed.
             return None
+        return f"{BASE_DOMAIN}/realestateandhomes-search/{location}"
+    if "/apartments/" in path:
+        tail = path.split("/apartments/", 1)[1]
+        location = tail.split("/", 1)[0]
+        if not location:
+            return None
+        return f"{BASE_DOMAIN}/apartments/{location}"
+    return None
+
+
+def read_seeds(path: str = "urls.txt") -> list[str]:
+    file = Path(path)
+    if not file.exists():
+        raise FileNotFoundError(f"Seed URL file not found: {file.resolve()}")
+    seeds: list[str] = []
+    for line in file.read_text(encoding="utf-8", errors="ignore").splitlines():
+        seed = search_seed(line)
+        if seed and seed not in seeds:
+            seeds.append(seed)
+    return seeds
+
+
+def _address_parts(location: dict[str, Any]) -> tuple[str, str, str, str]:
+    addr = location.get("address") or {}
+    street = clean(addr.get("line") or addr.get("street_address") or addr.get("streetAddress"))
+    city = clean(addr.get("city") or location.get("city"))
+    state = clean(addr.get("state_code") or addr.get("state") or location.get("state_code"))
+    postal = clean(addr.get("postal_code") or addr.get("postalCode") or location.get("postal_code"))
+    full = ", ".join(x for x in (street, city, state, postal) if x)
+    return full, city, state, postal
+
+
+def _first_image(prop: dict[str, Any]) -> str:
+    photo = prop.get("primary_photo") or prop.get("photo") or {}
+    if isinstance(photo, dict):
+        return clean(photo.get("href") or photo.get("url"))
+    if isinstance(photo, list) and photo:
+        first = photo[0]
+        if isinstance(first, dict):
+            return clean(first.get("href") or first.get("url"))
+        return clean(first)
+    photos = prop.get("photos")
+    if isinstance(photos, list) and photos:
+        first = photos[0]
+        if isinstance(first, dict):
+            return clean(first.get("href") or first.get("url"))
+    return ""
+
+
+def _listing_from_payload(prop: dict[str, Any], page_url: str) -> Listing | None:
+    # Avoid interpreting arbitrary nested objects as listings.
+    permalink = clean(prop.get("permalink") or prop.get("href"))
+    property_id = clean(prop.get("property_id") or prop.get("listing_id") or prop.get("propertyId"))
+    description = prop.get("description") if isinstance(prop.get("description"), dict) else {}
+    location = prop.get("location") if isinstance(prop.get("location"), dict) else {}
+    if not (property_id or permalink) or not ("list_price" in prop or "price" in prop or description or location):
+        return None
+    address, city, state, postal = _address_parts(location)
+    if not address:
+        address = clean(prop.get("address") or prop.get("full_address"))
+    url = permalink
+    if url and not url.startswith("http"):
+        url = urljoin(BASE_DOMAIN + "/realestateandhomes-detail/", url.lstrip("/"))
+    price_raw = prop.get("list_price", prop.get("price", ""))
+    price = clean(price_raw)
+    if price and price.replace(".", "", 1).isdigit():
+        try:
+            price = f"${int(float(price)):,}"
+        except (ValueError, OverflowError):
+            pass
+    beds = description.get("beds", prop.get("beds", ""))
+    baths = description.get("baths_consolidated", description.get("baths", prop.get("baths", "")))
+    sqft = description.get("sqft", prop.get("sqft", ""))
+    lot = description.get("lot_sqft", description.get("lot_size", prop.get("lot_sqft", "")))
+    if isinstance(lot, dict):
+        lot = lot.get("value", lot.get("size", ""))
+    status = clean(prop.get("status"))
+    listing_date = clean(prop.get("list_date") or prop.get("list_date_time"))
+    agents = prop.get("advertisers") or prop.get("agents") or []
+    agent_name = agent_phone = ""
+    if isinstance(agents, list) and agents and isinstance(agents[0], dict):
+        agent_name = clean(agents[0].get("name"))
+        phones = agents[0].get("phones") or []
+        if isinstance(phones, list) and phones and isinstance(phones[0], dict):
+            agent_phone = clean(phones[0].get("number"))
+    listing = Listing(
+        listing_id=property_id,
+        price=price,
+        address=address,
+        city=city,
+        state=state,
+        zip_code=postal,
+        bedrooms=clean(beds),
+        bathrooms=clean(baths),
+        sqft=clean(sqft),
+        lot_size=clean(lot),
+        property_type=clean(prop.get("type") or prop.get("property_type")),
+        status=status,
+        listing_date=listing_date,
+        agent_name=agent_name,
+        agent_phone=agent_phone,
+        url=url,
+        image_url=_first_image(prop),
+        search_page_url=page_url,
+        scraped_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    )
+    return listing if listing.address or listing.price or listing.url else None
+
+
+def _walk_payload(obj: Any, page_url: str) -> Iterable[Listing]:
+    """Walk nested Next.js data and yield listing-like records."""
+    if isinstance(obj, dict):
+        item = _listing_from_payload(obj, page_url)
+        if item:
+            yield item
+            # Don't walk children of a recognized property record; prevents sub-object noise.
+            return
+        for value in obj.values():
+            yield from _walk_payload(value, page_url)
+    elif isinstance(obj, list):
+        for value in obj:
+            yield from _walk_payload(value, page_url)
+
+
+def _text(card: Any, selectors: tuple[str, ...]) -> str:
+    for selector in selectors:
+        try:
+            el = card.select_one(selector)
+        except Exception:
+            continue
+        if el:
+            value = clean(el.get("content") or el.get_text(" ", strip=True))
+            if value:
+                return value
+    return ""
+
+
+def parse_html(html: str, page_url: str) -> list[Listing]:
+    soup = BeautifulSoup(html, "lxml")
+    found: list[Listing] = []
+    # Realtor.com commonly embeds search results in Next.js data.
+    for script in soup.select('script#__NEXT_DATA__[type="application/json"], script#__NEXT_DATA__'):
+        raw = script.string or script.get_text()
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        found.extend(_walk_payload(data, page_url))
+    if found:
+        return _dedupe(found)
+
+    # DOM fallback: data-testid names can change, so several known variants are tried.
+    cards = soup.select('[data-testid="property-card"], [data-testid^="card-content-"], li[data-testid="result-card"], .component_property-card')
+    for card in cards:
+        link = card.select_one('a[data-testid="card-anchor"], a[data-testid="card-link"], a[data-card-link="true"], a[href*="realestateandhomes-detail"]')
+        href = urljoin(page_url, link.get("href", "")) if link else ""
+        address = _text(card, ('[data-testid="card-address"]', '[data-testid="card-address-1"]', '[data-label="pc-address"]', '.address'))
+        city_state_zip = _text(card, ('[data-testid="card-address-2"]', '[data-label="pc-address"] .address-city', '.address-city'))
+        if address and city_state_zip and city_state_zip not in address:
+            address = f"{address}, {city_state_zip}"
+        price = _text(card, ('[data-testid="card-price"]', '[data-label="pc-price"]', '[data-label="pc-price"] span'))
+        beds = _text(card, ('[data-testid="property-meta-beds"]', '[data-testid="card-meta-beds"]', '[data-label="pc-meta-beds"]'))
+        baths = _text(card, ('[data-testid="property-meta-baths"]', '[data-testid="card-meta-baths"]', '[data-label="pc-meta-baths"]'))
+        sqft = _text(card, ('[data-testid="property-meta-sqft"]', '[data-testid="card-meta-sqft"]', '[data-label="pc-meta-sqft"]'))
+        lot = _text(card, ('[data-testid="property-meta-lot-size"]', '[data-testid="card-meta-lot-size"]', '[data-label="pc-meta-lot-size"]'))
+        image = card.select_one('img[data-testid="card-img"], img[src], img[data-src]')
+        image_url = clean((image.get("src") or image.get("data-src")) if image else "")
+        if not (href or address or price):
+            continue
+        pid = ""
+        m = re.search(r"_([A-Z0-9-]+)$", urlparse(href).path)
+        if m:
+            pid = m.group(1)
+        found.append(Listing(
+            listing_id=pid, price=price, address=address, bedrooms=beds,
+            bathrooms=baths, sqft=sqft, lot_size=lot, url=href,
+            image_url=image_url, search_page_url=page_url,
+            scraped_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        ))
+    return _dedupe(found)
+
+
+def _dedupe(items: list[Listing]) -> list[Listing]:
+    seen: set[str] = set()
+    out: list[Listing] = []
+    for item in items:
+        key = item.key()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(item)
+    return out
+
+
+def allowed_by_robots(session: requests.Session, url: str, user_agent: str) -> bool:
+    parsed = urlparse(url)
+    robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
+    try:
+        response = session.get(robots_url, timeout=20)
         if response.status_code != 200:
-            logger.info("No usable robots.txt at %s (HTTP %s).", robots_url, response.status_code)
-            return None
+            LOG.warning("Could not read robots.txt (HTTP %s); stopping conservatively is not possible, continuing.", response.status_code)
+            return True
         parser = RobotFileParser()
+        parser.set_url(robots_url)
         parser.parse(response.text.splitlines())
-        parser.modified()
-        return parser
+        return parser.can_fetch(user_agent, url)
+    except requests.RequestException as exc:
+        LOG.warning("robots.txt request failed (%s); continuing without a robots decision.", exc)
+        return True
 
-    def is_allowed(self, url: str) -> bool:
-        parsed = urlparse(url)
-        origin = f"{parsed.scheme}://{parsed.netloc}"
-        if origin not in self._robots:
-            self._robots[origin] = self._load_robots(origin)
-        parser = self._robots[origin]
-        return True if parser is None else parser.can_fetch("*", url)
 
-    # ------------------------------------------------------------ networking
-    def _backoff(self, attempt: int, retry_after: Optional[str] = None) -> None:
-        delay = self.config.backoff_factor * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
-        if retry_after and str(retry_after).strip().isdigit():
-            delay = max(delay, min(int(retry_after), MAX_RETRY_AFTER_SECONDS))
-        logger.info("Waiting %.1fs before retrying (attempt %d)...", delay, attempt)
-        time.sleep(delay)
+def make_page_url(seed: str, page: int) -> str:
+    if page <= 1:
+        return seed
+    return f"{seed.rstrip('/')}/pg-{page}"
 
-    @staticmethod
-    def _decode(response: Any) -> str:
-        content_type = str(response.headers.get("Content-Type", "")).lower()
-        if "charset" not in content_type:
-            response.encoding = getattr(response, "apparent_encoding", None) or "utf-8"
-        return response.text
 
-    def fetch(self, url: str) -> Optional[str]:
-        """Download ``url`` with retries. Returns HTML text or None on failure."""
-        cfg = self.config
-        for attempt in range(1, cfg.max_retries + 1):
+def scrape() -> list[Listing]:
+    seeds = read_seeds(os.getenv("URLS_FILE", "urls.txt"))
+    max_seeds = int(os.getenv("MAX_SEEDS", "60"))
+    max_pages_per_seed = int(os.getenv("MAX_PAGES_PER_SEED", "5"))
+    max_total_pages = int(os.getenv("MAX_TOTAL_PAGES", "200"))
+    max_listings = int(os.getenv("MAX_LISTINGS", "5000"))
+    delay = max(1.0, float(os.getenv("REQUEST_DELAY", "2.0")))
+    user_agent = os.getenv("USER_AGENT", "Mozilla/5.0 (compatible; PropertyResearchBot/1.0; +https://www.realtor.com/terms-of-service)")
+    seeds = seeds[:max_seeds]
+    LOG.info("Loaded %d unique search seeds; processing %d (MAX_SEEDS=%d).", len(read_seeds(os.getenv("URLS_FILE", "urls.txt"))), len(seeds), max_seeds)
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": user_agent,
+        "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+    all_rows: dict[str, Listing] = {}
+    pages_done = 0
+    robots_checked = False
+    for seed_index, seed in enumerate(seeds, 1):
+        LOG.info("Seed %d/%d: %s", seed_index, len(seeds), seed)
+        for page_num in range(1, max_pages_per_seed + 1):
+            if pages_done >= max_total_pages or len(all_rows) >= max_listings:
+                break
+            url = make_page_url(seed, page_num)
+            if not robots_checked:
+                robots_checked = True
+                if not allowed_by_robots(session, url, user_agent):
+                    LOG.error("robots.txt disallows this search URL. Stopping; no bypass attempted: %s", url)
+                    return list(all_rows.values())
+            if pages_done:
+                time.sleep(delay + random.uniform(0, 0.5))
             try:
-                response = self.session.get(
-                    url, timeout=cfg.timeout, verify=cfg.verify_ssl
-                )
+                response = session.get(url, timeout=30)
+                pages_done += 1
+                if response.status_code in (403, 429):
+                    LOG.warning("HTTP %s from Realtor.com at %s; stopping to avoid repeated requests.", response.status_code, url)
+                    return list(all_rows.values())
+                response.raise_for_status()
             except requests.RequestException as exc:
-                logger.warning("Request error for %s (attempt %d/%d): %s",
-                               url, attempt, cfg.max_retries, exc)
-                if attempt == cfg.max_retries:
-                    break
-                self._backoff(attempt)
-                continue
-
-            status = response.status_code
-            if 200 <= status < 300:
-                return self._decode(response)
-            if status in (404, 410):
-                logger.info("HTTP %s for %s (end of results).", status, url)
-                return None
-            if status in RETRYABLE_STATUS:
-                logger.warning("HTTP %s for %s (attempt %d/%d).",
-                               status, url, attempt, cfg.max_retries)
-                if attempt == cfg.max_retries:
-                    break
-                self._backoff(attempt, response.headers.get("Retry-After"))
-                continue
-            logger.error("Non-retryable HTTP %s for %s.", status, url)
-            return None
-
-        logger.error("Giving up on %s after %d attempts.", url, cfg.max_retries)
-        return None
-
-    def _polite_delay(self) -> None:
-        delay = self.config.request_delay
-        if delay > 0:
-            time.sleep(delay + random.uniform(0, delay * 0.3))
-
-    # --------------------------------------------------------------- parsing
-    def _listing_from_card(self, card: Any, page_url: str) -> Listing:
-        cfg = self.config
-        href = select_value(card, cfg.url_selector)
-        url = ""
-        if href and not href.lower().startswith(("javascript:", "#")):
-            url = urljoin(page_url, href)
-        price_text = select_value(card, cfg.price_selector)
-        price_value, currency = parse_price(price_text)
-        area_text = select_value(card, cfg.area_selector)
-        image = select_value(card, cfg.image_selector)
-        return Listing(
-            listing_id=select_value(card, cfg.id_selector) or id_from_url(url),
-            title=select_value(card, cfg.title_selector),
-            price=price_text,
-            price_value=price_value,
-            currency=currency,
-            address=select_value(card, cfg.address_selector),
-            property_type=select_value(card, cfg.property_type_selector),
-            bedrooms=parse_number(select_value(card, cfg.bedrooms_selector)),
-            bathrooms=parse_number(select_value(card, cfg.bathrooms_selector)),
-            area=area_text,
-            area_value=parse_number(area_text),
-            description=select_value(card, cfg.description_selector)[:MAX_DESCRIPTION_LENGTH],
-            url=url,
-            image_url=urljoin(page_url, image) if image else "",
-            source_page=page_url,
-            scraped_at=self._run_timestamp,
-        )
-
-    def _listing_from_json_ld(self, item: Dict[str, Any], page_url: str) -> Listing:
-        offers = item.get("offers")
-        if isinstance(offers, list):
-            offers = offers[0] if offers else {}
-        if not isinstance(offers, dict):
-            offers = {}
-        offered = offers.get("itemOffered")
-        if not isinstance(offered, dict):
-            offered = {}
-
-        def pick(*keys: str) -> Any:
-            for source in (item, offered):
-                for key in keys:
-                    value = source.get(key)
-                    if value not in (None, "", []):
-                        return value
-            return None
-
-        price_raw = offers.get("price")
-        if price_raw in (None, ""):
-            spec = offers.get("priceSpecification")
-            if isinstance(spec, dict):
-                price_raw = spec.get("price")
-        if price_raw in (None, ""):
-            price_raw = item.get("price")
-
-        currency = clean_text(offers.get("priceCurrency"))
-        if isinstance(price_raw, (int, float)) and not isinstance(price_raw, bool):
-            price_value: Optional[float] = _tidy(float(price_raw))
-            price_text = f"{currency} {price_raw}".strip()
-        else:
-            price_text = clean_text(price_raw)
-            price_value, detected = parse_price(price_text)
-            currency = currency or detected
-            if currency and price_text and currency not in price_text:
-                price_text = f"{currency} {price_text}"
-
-        area_raw = pick("floorSize")
-        if isinstance(area_raw, dict):
-            area_value = _json_number(area_raw)
-            area_text = clean_text(f"{area_raw.get('value', '')} {area_raw.get('unitText', '')}")
-        else:
-            area_text = clean_text(area_raw)
-            area_value = parse_number(area_text)
-
-        raw_url = item.get("url") or offers.get("url") or ""
-        if not raw_url:
-            at_id = str(item.get("@id", ""))
-            raw_url = at_id if at_id.startswith(("http", "/")) else ""
-        url = urljoin(page_url, str(raw_url)) if raw_url else ""
-
-        property_type = clean_text(pick("accommodationCategory", "propertyType"))
-        if not property_type:
-            for t in _as_list(item.get("@type")):
-                if str(t).lower() in RESIDENCE_TYPES:
-                    property_type = str(t)
-                    break
-
-        image = _first_url(pick("image", "photo"))
-        return Listing(
-            listing_id=clean_text(pick("identifier", "sku", "productID")) or id_from_url(url),
-            title=clean_text(pick("name", "headline")),
-            price=price_text,
-            price_value=price_value,
-            currency=currency,
-            address=_format_address(pick("address", "location")),
-            property_type=property_type,
-            bedrooms=_json_number(pick("numberOfBedrooms", "numberOfRooms")),
-            bathrooms=_json_number(
-                pick("numberOfBathroomsTotal", "numberOfFullBathrooms", "numberOfBathrooms")
-            ),
-            area=area_text,
-            area_value=area_value,
-            description=clean_text(pick("description"))[:MAX_DESCRIPTION_LENGTH],
-            url=url,
-            image_url=urljoin(page_url, image) if image else "",
-            source_page=page_url,
-            scraped_at=self._run_timestamp,
-        )
-
-    def _listings_from_json_ld(self, soup: BeautifulSoup, page_url: str) -> List[Listing]:
-        listings: List[Listing] = []
-        for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
-            raw = script.string or script.get_text() or ""
-            if not raw.strip():
-                continue
-            try:
-                data = json.loads(raw)
-            except json.JSONDecodeError:
-                logger.debug("Skipping invalid JSON-LD block.")
-                continue
-            for item in iter_json_ld_items(data):
-                listing = self._listing_from_json_ld(item, page_url)
-                if listing.is_meaningful():
-                    listings.append(listing)
-        return listings
-
-    def _parse_soup(self, soup: BeautifulSoup, page_url: str) -> List[Listing]:
-        try:
-            cards = soup.select(self.config.listing_selector)
-        except Exception as exc:
-            raise ConfigError(
-                f"Invalid LISTING_SELECTOR {self.config.listing_selector!r}: {exc}"
-            ) from exc
-        listings = []
-        for card in cards:
-            listing = self._listing_from_card(card, page_url)
-            if listing.is_meaningful():
-                listings.append(listing)
-        if not listings and self.config.use_json_ld:
-            listings = self._listings_from_json_ld(soup, page_url)
-        return listings
-
-    def parse_page(self, html: str, page_url: str) -> List[Listing]:
-        """Parse listings out of one HTML page."""
-        return self._parse_soup(BeautifulSoup(html, "lxml"), page_url)
-
-    # ------------------------------------------------------------ pagination
-    def _page_url(self, page_number: int) -> str:
-        return self.config.target_url.replace("{page}", str(page_number))
-
-    def first_url(self) -> str:
-        if "{page}" in self.config.target_url:
-            return self._page_url(self.config.start_page)
-        return self.config.target_url
-
-    def find_next_page(
-        self, soup: Optional[BeautifulSoup], current_url: str, page_index: int
-    ) -> Optional[str]:
-        cfg = self.config
-        if cfg.next_page_selector:
-            if soup is None:
-                return None
-            href = select_value(soup, cfg.next_page_selector)
-            if not href or href.lower().startswith(("javascript:", "#")):
-                return None
-            return urljoin(current_url, href)
-        if "{page}" in cfg.target_url:
-            return self._page_url(cfg.start_page + (page_index + 1) * cfg.page_step)
-        return None
-
-    # ------------------------------------------------------------------- run
-    def run(self) -> List[Listing]:
-        cfg = self.config
-        unique: Dict[str, Listing] = {}
-        visited = set()
-        url: Optional[str] = self.first_url()
-        stale = 0
-        failures = 0
-        started = time.monotonic()
-
-        for page_index in range(cfg.max_pages):
-            if not url or len(unique) >= cfg.max_listings:
+                LOG.warning("Request failed for %s: %s", url, exc)
                 break
-            if time.monotonic() - started > cfg.max_runtime_seconds:
-                logger.warning("Runtime limit reached; stopping with partial results.")
+            page_rows = parse_html(response.text, url)
+            new_count = 0
+            for row in page_rows:
+                if row.key() not in all_rows:
+                    all_rows[row.key()] = row
+                    new_count += 1
+                    if len(all_rows) >= max_listings:
+                        break
+            LOG.info("Page %d: parsed %d records, %d new, %d unique total.", page_num, len(page_rows), new_count, len(all_rows))
+            # Don't walk empty/non-listing pages repeatedly.
+            if not page_rows or (page_num > 1 and new_count == 0):
                 break
-            if url in visited:
-                logger.info("Already visited %s; stopping pagination.", url)
-                break
-            visited.add(url)
-
-            if cfg.respect_robots and not self.is_allowed(url):
-                raise RobotsDisallowedError(f"robots.txt disallows fetching {url}")
-            if page_index > 0:
-                self._polite_delay()
-
-            html = self.fetch(url)
-            if html is None:
-                failures += 1
-                self.stats["pages_failed"] += 1
-                if failures >= cfg.max_consecutive_failures:
-                    logger.error("Too many consecutive failures; stopping.")
-                    break
-                url = self.find_next_page(None, url, page_index)
-                continue
-
-            failures = 0
-            self.stats["pages_fetched"] += 1
-            soup = BeautifulSoup(html, "lxml")
-            page_listings = self._parse_soup(soup, url)
-            self.stats["listings_seen"] += len(page_listings)
-
-            new = 0
-            for listing in page_listings:
-                key = listing.dedupe_key()
-                if key in unique:
-                    self.stats["duplicates_skipped"] += 1
-                    continue
-                unique[key] = listing
-                new += 1
-                if len(unique) >= cfg.max_listings:
-                    break
-
-            logger.info("Page %d: %d found, %d new, %d total unique.",
-                        page_index + 1, len(page_listings), new, len(unique))
-
-            stale = 0 if new else stale + 1
-            if stale >= cfg.stale_page_limit:
-                logger.info("No new listings on %d consecutive pages; stopping.", stale)
-                break
-            url = self.find_next_page(soup, url, page_index)
-
-        return list(unique.values())
+        if pages_done >= max_total_pages or len(all_rows) >= max_listings:
+            break
+    LOG.info("Finished: pages=%d unique_listings=%d", pages_done, len(all_rows))
+    return list(all_rows.values())
 
 
-# --------------------------------------------------------------------------- #
-# Export
-# --------------------------------------------------------------------------- #
-def export_listings(
-    listings: List[Listing], output_dir: str, basename: str = "listings"
-) -> Dict[str, Path]:
-    """Write listings to CSV and JSON files. Returns the created paths."""
-    directory = Path(output_dir)
-    directory.mkdir(parents=True, exist_ok=True)
-    columns = [f.name for f in fields(Listing)]
-    rows = [asdict(listing) for listing in listings]
-
-    csv_path = directory / f"{basename}.csv"
-    with csv_path.open("w", newline="", encoding="utf-8-sig") as handle:
-        writer = csv.DictWriter(handle, fieldnames=columns)
+def export(rows: list[Listing]) -> None:
+    out_dir = Path(os.getenv("OUTPUT_DIR", "output"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    basename = os.getenv("OUTPUT_BASENAME", "listings")
+    records = [asdict(row) for row in rows]
+    csv_path = out_dir / f"{basename}.csv"
+    json_path = out_dir / f"{basename}.json"
+    columns = list(Listing.__dataclass_fields__.keys())
+    with csv_path.open("w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=columns)
         writer.writeheader()
-        writer.writerows(rows)
-
-    json_path = directory / f"{basename}.json"
-    with json_path.open("w", encoding="utf-8") as handle:
-        json.dump(rows, handle, ensure_ascii=False, indent=2)
-
-    return {"csv": csv_path, "json": json_path}
+        writer.writerows(records)
+    json_path.write_text(json.dumps(records, indent=2, ensure_ascii=False), encoding="utf-8")
+    LOG.info("Wrote %d listings to %s and %s", len(rows), csv_path, json_path)
 
 
-def write_step_summary(listings: List[Listing], stats: Dict[str, int]) -> None:
-    """Append a short summary to the GitHub Actions job summary if available."""
-    path = os.environ.get("GITHUB_STEP_SUMMARY")
-    if not path:
-        return
+def main() -> int:
+    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(), format="%(asctime)s %(levelname)s %(message)s")
     try:
-        with open(path, "a", encoding="utf-8") as handle:
-            handle.write("## Scrape summary\n\n")
-            handle.write(f"- Unique listings: **{len(listings)}**\n")
-            for key, value in stats.items():
-                handle.write(f"- {key.replace('_', ' ').capitalize()}: {value}\n")
-    except OSError:
-        pass
-
-
-# --------------------------------------------------------------------------- #
-# CLI
-# --------------------------------------------------------------------------- #
-def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Real estate listing scraper.")
-    parser.add_argument("--url", help="Override TARGET_URL.")
-    parser.add_argument("--max-listings", type=int, help="Override MAX_LISTINGS.")
-    parser.add_argument("--max-pages", type=int, help="Override MAX_PAGES.")
-    parser.add_argument("--output-dir", help="Override OUTPUT_DIR.")
-    parser.add_argument("--log-level", help="DEBUG, INFO, WARNING, ERROR.")
-    parser.add_argument("--strict", action="store_true",
-                        help="Exit with code 4 if fewer than MIN_LISTINGS are collected.")
-    return parser.parse_args(argv)
-
-
-def main(argv: Optional[List[str]] = None) -> int:
-    args = parse_args(argv)
-    try:
-        config = load_config()
-        overrides: Dict[str, Any] = {}
-        if args.url:
-            overrides["target_url"] = args.url
-        if args.max_listings:
-            overrides["max_listings"] = args.max_listings
-        if args.max_pages:
-            overrides["max_pages"] = args.max_pages
-        if args.output_dir:
-            overrides["output_dir"] = args.output_dir
-        if args.log_level:
-            overrides["log_level"] = args.log_level
-        if args.strict:
-            overrides["strict"] = True
-        config = replace(config, **overrides)
-        logging.basicConfig(
-            level=getattr(logging, config.log_level.upper(), logging.INFO),
-            format="%(asctime)s %(levelname)s %(message)s",
-        )
-        config.validate()
-    except ConfigError as exc:
-        logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-        logger.error("Configuration error: %s", exc)
-        return 2
-
-    scraper = Scraper(config)
-    try:
-        listings = scraper.run()
-    except RobotsDisallowedError as exc:
-        logger.error("%s", exc)
-        return 3
-    except ConfigError as exc:
-        logger.error("Configuration error: %s", exc)
-        return 2
-
-    logger.info("Stats: %s", scraper.stats)
-    write_step_summary(listings, scraper.stats)
-
-    if not listings:
-        logger.error("No listings were collected. Check TARGET_URL and the CSS selectors.")
+        rows = scrape()
+        export(rows)
+    except Exception:
+        LOG.exception("Scraper failed")
         return 1
-
-    paths = export_listings(listings, config.output_dir, config.output_basename)
-    logger.info("Exported %d listings to %s and %s.",
-                len(listings), paths["csv"], paths["json"])
-
-    if len(listings) < config.min_listings:
-        logger.warning("Collected %d listings, below the target of %d.",
-                       len(listings), config.min_listings)
-        if config.strict:
-            return 4
+    if not rows:
+        LOG.error("No listings extracted. Realtor.com may have returned a blocked page or changed its data structure. Check the Actions log.")
+        return 1
     return 0
 
-
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
