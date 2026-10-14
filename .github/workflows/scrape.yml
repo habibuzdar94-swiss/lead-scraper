@@ -1,91 +1,59 @@
-name: Scrape listings
+name: Scrape Realtor.com property listings
 
 on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 4 * * 1"
   push:
     paths:
+      - "scraper.py"
+      - "test_scraper.py"
+      - "requirements.txt"
+      - "urls.txt"
       - ".github/workflows/scrape.yml"
-  schedule:
-    - cron: "0 3 * * *"
-  workflow_dispatch:
-    inputs:
-      target_url:
-        description: "Listing URL (use {page} for pagination). Overrides the TARGET_URL variable."
-        required: false
-        default: ""
-      max_listings:
-        description: "Maximum number of unique listings to collect"
-        required: false
-        default: ""
 
 permissions:
   contents: write
 
 concurrency:
-  group: scrape-listings
+  group: realtor-property-scraper
   cancel-in-progress: false
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-
+    timeout-minutes: 55
     steps:
-      - name: Check out repository
+      - name: Checkout repository
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: pip
           cache-dependency-path: requirements.txt
-
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
+        run: python -m pip install --upgrade pip && pip install -r requirements.txt
       - name: Run tests
         run: python -m pytest -q
-
       - name: Run scraper
         env:
-          TARGET_URL: ${{ github.event.inputs.target_url || vars.TARGET_URL }}
-          MAX_LISTINGS: ${{ github.event.inputs.max_listings || vars.MAX_LISTINGS }}
-          MIN_LISTINGS: ${{ vars.MIN_LISTINGS }}
-          MAX_PAGES: ${{ vars.MAX_PAGES }}
-          START_PAGE: ${{ vars.START_PAGE }}
-          PAGE_STEP: ${{ vars.PAGE_STEP }}
-          NEXT_PAGE_SELECTOR: ${{ vars.NEXT_PAGE_SELECTOR }}
-          LISTING_SELECTOR: ${{ vars.LISTING_SELECTOR }}
-          ID_SELECTOR: ${{ vars.ID_SELECTOR }}
-          TITLE_SELECTOR: ${{ vars.TITLE_SELECTOR }}
-          URL_SELECTOR: ${{ vars.URL_SELECTOR }}
-          PRICE_SELECTOR: ${{ vars.PRICE_SELECTOR }}
-          ADDRESS_SELECTOR: ${{ vars.ADDRESS_SELECTOR }}
-          PROPERTY_TYPE_SELECTOR: ${{ vars.PROPERTY_TYPE_SELECTOR }}
-          BEDROOMS_SELECTOR: ${{ vars.BEDROOMS_SELECTOR }}
-          BATHROOMS_SELECTOR: ${{ vars.BATHROOMS_SELECTOR }}
-          AREA_SELECTOR: ${{ vars.AREA_SELECTOR }}
-          DESCRIPTION_SELECTOR: ${{ vars.DESCRIPTION_SELECTOR }}
-          IMAGE_SELECTOR: ${{ vars.IMAGE_SELECTOR }}
-          USE_JSON_LD: ${{ vars.USE_JSON_LD }}
-          REQUEST_DELAY: ${{ vars.REQUEST_DELAY }}
-          RESPECT_ROBOTS: ${{ vars.RESPECT_ROBOTS }}
-          USER_AGENT: ${{ vars.USER_AGENT }}
-          STRICT: ${{ vars.STRICT }}
+          MAX_SEEDS: ${{ vars.MAX_SEEDS || '60' }}
+          MAX_PAGES_PER_SEED: ${{ vars.MAX_PAGES_PER_SEED || '5' }}
+          MAX_TOTAL_PAGES: ${{ vars.MAX_TOTAL_PAGES || '200' }}
+          MAX_LISTINGS: ${{ vars.MAX_LISTINGS || '5000' }}
+          REQUEST_DELAY: ${{ vars.REQUEST_DELAY || '2' }}
+          LOG_LEVEL: INFO
         run: python scraper.py
-
-      - name: Upload results as artifact
+      - name: Upload CSV and JSON
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: listings-${{ github.run_number }}
+          name: realtor-listings-${{ github.run_number }}
           path: output/
           if-no-files-found: warn
           retention-days: 30
-
-      - name: Commit results to repository
+      - name: Commit results
         if: success()
         run: |
           git config user.name "github-actions[bot]"
@@ -94,10 +62,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes to commit."
           else
-            git commit -m "chore: update scraped listings [skip ci]"
+            git commit -m "chore: update Realtor.com listings [skip ci]"
             git push
           fi
-
-
-
-          
